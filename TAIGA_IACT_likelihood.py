@@ -37,11 +37,18 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import pickle
 import random
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+DEFAULT_CONFIG_ENV = "TAIGA_LIKELIHOOD_CONFIG"
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config").joinpath(
+    "reconstruction_config.json"
+)
 
 __all__ = [
     "PixelMeasurement",
@@ -480,6 +487,18 @@ class TemplateLibrary:
 # Likelihood evaluation
 # ---------------------------------------------------------------------------
 
+        candidates: List[Tuple[float, int]] = []
+        for idx, vector in enumerate(self.parameters):
+            deltas = []
+            for axis, component in enumerate(vector):
+                scale = self.parameter_scales[axis]
+                if axis == 5:
+                    delta = wrap_angle(component - params[axis]) / scale
+                else:
+                    delta = (component - params[axis]) / scale
+                deltas.append(delta)
+            distance = max(_vector_norm(deltas), 1e-6)
+            candidates.append((distance, idx))
 
 class LikelihoodModel:
     """Gaussian log-likelihood between an observation and interpolated template."""
@@ -785,6 +804,71 @@ def reconstruct_dataset(
                 "tel_fi": float(truth.tel_fi),
             }
         )
+    csv_name = stem.replace("_clean_", "_hillas_")
+    csv_name = csv_name.rsplit(".", 1)[0] + ".csv"
+    return txt_path.with_name(csv_name)
+
+
+def _load_datasets(
+    paths: Sequence[Path], limit: Optional[int] = None
+) -> TAIGADataset:
+    paths = list(paths)
+    if not paths:
+        raise ValueError("At least one template file must be provided")
+
+    events: List[EventImage] = []
+    parameters: List[EventParameters] = []
+    for txt_path in paths:
+        csv_path = _matching_csv_path(txt_path)
+        dataset = TAIGADataset(txt_path, csv_path)
+        events.extend(dataset.events)
+        parameters.extend(dataset.parameters)
+
+    if limit is not None:
+        limit = max(0, int(limit))
+        events = events[:limit]
+        parameters = parameters[:limit]
+
+    combined = TAIGADataset.__new__(TAIGADataset)  # type: ignore[misc]
+    combined.events = events
+    combined.parameters = parameters
+    combined.template_vectors = [p.template_vector() for p in parameters]
+    combined.pixel_indexer = PixelIndexer(events)
+    return combined
+
+
+def load_configuration(path: Path) -> Dict[str, object]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    required = ["template_txt_files", "test_txt_file", "output_csv", "model_path"]
+    for key in required:
+        if key not in payload:
+            raise ValueError(f"Configuration missing required key {key!r}")
+    return payload
+
+
+def _iter_template_paths(entries: Iterable[str]) -> Iterator[Path]:
+    for entry in entries:
+        path = Path(entry).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Template file not found: {path}")
+        yield path
+
+
+def save_model_package(
+    model: LikelihoodModel,
+    bounds: Sequence[Tuple[float, float]],
+    path: Path,
+) -> None:
+    """Persist the likelihood model and optimisation bounds to ``path``."""
+
+    serialised = {
+        "version": 1,
+        "noise_floor": float(model.noise_floor),
+        "pedestal_variance": float(model.pedestal_variance),
+        "bounds": [[float(lo), float(hi)] for lo, hi in bounds],
+        "library": model.library.to_serializable(),
+    }
 
     return results
 
@@ -891,3 +975,52 @@ def run_reconstruction_from_config(config_path: Path) -> List[Dict[str, float]]:
             writer.writerow(row)
 
     return results
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Entry point for running the reconstruction from the command line."""
+
+    if argv is None:
+        argv = sys.argv[1:]
+
+    config_path: Path
+    if argv:
+        config_path = Path(argv[0])
+    else:
+        env_value = os.environ.get(DEFAULT_CONFIG_ENV)
+        if env_value:
+            config_path = Path(env_value)
+        else:
+            config_path = DEFAULT_CONFIG_PATH
+
+    config_path = config_path.expanduser().resolve()
+
+    if not config_path.exists():
+        print(
+            "[TAIGA] Configuration file not found:",
+            config_path,
+            f"(set {DEFAULT_CONFIG_ENV} or pass a path)",
+        )
+        return 1
+
+    config = load_configuration(config_path)
+    output_csv = Path(config["output_csv"]).expanduser().resolve()
+
+    print(f"[TAIGA] Loading reconstruction settings from {config_path}")
+    print(
+        f"[TAIGA] Cached model will be stored at "
+        f"{Path(config['model_path']).expanduser().resolve()}"
+    )
+
+    results = run_reconstruction_from_config(config_path)
+
+    print(
+        f"[TAIGA] Processed {len(results)} test events. "
+        f"Results written to {output_csv}"
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

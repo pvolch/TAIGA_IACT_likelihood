@@ -8,6 +8,26 @@ This repository provides a lightweight likelihood-based reconstruction pipeline 
 2. **Train or load the model** – call `run_reconstruction_from_config` with the configuration path.  The function will assemble the template library, fit the likelihood model, and cache it to disk.  Subsequent runs reuse the saved model unless `force_rebuild` is set.
 3. **Inspect accuracy** – open the supplied notebook in `notebooks/reconstruction_analysis.ipynb` to load the cached model, reconstruct the test events, and visualise the relative energy error, core offsets, and arrival-direction accuracy.
 
+### Running the reconstruction script
+
+The module can be executed directly to train (or reuse) the cached model and reconstruct the configured test dataset.  By default it looks for `config/reconstruction_config.json` relative to the repository root:
+
+```bash
+python3 TAIGA_IACT_likelihood.py
+```
+
+To use an alternative configuration, either pass its path as the first argument or set the `TAIGA_LIKELIHOOD_CONFIG` environment variable:
+
+```bash
+python3 TAIGA_IACT_likelihood.py path/to/custom_config.json
+
+# or
+
+TAIGA_LIKELIHOOD_CONFIG=path/to/custom_config.json python3 TAIGA_IACT_likelihood.py
+```
+
+The command prints where the model and reconstruction table are stored so the notebook can load them afterwards.
+
 ### Configuration parameters
 
 The JSON configuration controls both the dataset selection and the optimisation behaviour.  All keys are optional unless noted otherwise:
