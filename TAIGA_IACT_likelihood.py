@@ -37,10 +37,11 @@ from __future__ import annotations
 import csv
 import json
 import math
+import pickle
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 __all__ = [
     "PixelMeasurement",
@@ -49,6 +50,9 @@ __all__ = [
     "TAIGADataset",
     "TemplateLibrary",
     "LikelihoodModel",
+    "load_model_package",
+    "reconstruct_dataset",
+    "save_model_package",
     "estimate_event_parameters",
     "load_configuration",
     "run_reconstruction_from_config",
@@ -358,6 +362,74 @@ class TemplateLibrary:
                 scales.append(max(maxima[idx] - minima[idx], 1.0))
         self.parameter_scales = scales
 
+    def to_serializable(self) -> Dict[str, Any]:
+        """Return a serialisable representation of the library."""
+
+        pixel_keys: List[Optional[Tuple[int, int]]] = [None] * self.indexer.size
+        for key, idx in self.indexer.lookup.items():
+            pixel_keys[idx] = (int(key[0]), int(key[1]))
+
+        if any(key is None for key in pixel_keys):
+            raise ValueError("Pixel indexer produced incomplete lookup table")
+
+        payload: Dict[str, Any] = {
+            "version": 1,
+            "idw_power": float(self.idw_power),
+            "max_templates": int(self.max_templates),
+            "pixel_keys": [list(key) for key in pixel_keys],
+            "pixel_positions": [list(pos) for pos in self.indexer.positions],
+            "templates": [template[:] for template in self.templates],
+            "parameters": [params[:] for params in self.parameters],
+            "parameter_scales": self.parameter_scales[:],
+        }
+        return payload
+
+    @classmethod
+    def from_serializable(cls, payload: Dict[str, Any]) -> "TemplateLibrary":
+        """Reconstruct a library from :meth:`to_serializable` output."""
+
+        version = int(payload.get("version", 0))
+        if version != 1:
+            raise ValueError(
+                f"Unsupported template library version {version}; expected 1"
+            )
+
+        library = cls.__new__(cls)  # type: ignore[misc]
+        library.dataset = None
+        library.idw_power = float(payload["idw_power"])
+        library.max_templates = int(payload["max_templates"])
+
+        pixel_keys_raw = payload["pixel_keys"]
+        pixel_positions_raw = payload["pixel_positions"]
+        if len(pixel_keys_raw) != len(pixel_positions_raw):
+            raise ValueError("Pixel key / position arrays must be the same length")
+
+        indexer = PixelIndexer.__new__(PixelIndexer)  # type: ignore[misc]
+        lookup: Dict[Tuple[int, int], int] = {}
+        for idx, entry in enumerate(pixel_keys_raw):
+            cluster, pixel = int(entry[0]), int(entry[1])
+            lookup[(cluster, pixel)] = idx
+        indexer.lookup = lookup
+        indexer.positions = [
+            (float(position[0]), float(position[1])) for position in pixel_positions_raw
+        ]
+        indexer.size = len(lookup)
+
+        library.indexer = indexer
+        library.templates = [
+            [float(value) for value in template]
+            for template in payload["templates"]
+        ]
+        library.parameters = [
+            [float(value) for value in params]
+            for params in payload["parameters"]
+        ]
+        library.parameter_scales = [
+            float(component) for component in payload["parameter_scales"]
+        ]
+
+        return library
+
     def interpolate(self, params: Vector) -> Tuple[Vector, Vector]:
         if len(params) != len(self.parameter_scales):
             raise ValueError(
@@ -591,7 +663,7 @@ def _load_datasets(
 def load_configuration(path: Path) -> Dict[str, object]:
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
-    required = ["template_txt_files", "test_txt_file", "output_csv"]
+    required = ["template_txt_files", "test_txt_file", "output_csv", "model_path"]
     for key in required:
         if key not in payload:
             raise ValueError(f"Configuration missing required key {key!r}")
@@ -606,41 +678,77 @@ def _iter_template_paths(entries: Iterable[str]) -> Iterator[Path]:
         yield path
 
 
-def run_reconstruction_from_config(config_path: Path) -> List[Dict[str, float]]:
-    config = load_configuration(config_path)
-    template_paths = list(
-        _iter_template_paths(config["template_txt_files"])  # type: ignore[arg-type]
-    )
-    template_limit = config.get("template_event_limit")
-    template_dataset = _load_datasets(template_paths, limit=template_limit)
+def save_model_package(
+    model: LikelihoodModel,
+    bounds: Sequence[Tuple[float, float]],
+    path: Path,
+) -> None:
+    """Persist the likelihood model and optimisation bounds to ``path``."""
 
-    library = TemplateLibrary(
-        template_dataset,
-        idw_power=float(config.get("idw_power", 2.0)),
-        max_templates=int(config.get("max_templates", 64)),
-    )
+    serialised = {
+        "version": 1,
+        "noise_floor": float(model.noise_floor),
+        "pedestal_variance": float(model.pedestal_variance),
+        "bounds": [[float(lo), float(hi)] for lo, hi in bounds],
+        "library": model.library.to_serializable(),
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        pickle.dump(serialised, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_model_package(
+    path: Path,
+) -> Tuple[LikelihoodModel, List[Tuple[float, float]]]:
+    """Load a previously saved likelihood model."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"Saved model not found: {path}")
+
+    with path.open("rb") as handle:
+        payload = pickle.load(handle)
+
+    version = int(payload.get("version", 0))
+    if version != 1:
+        raise ValueError(
+            f"Unsupported model package version {version}; expected 1"
+        )
+
+    library = TemplateLibrary.from_serializable(payload["library"])
     model = LikelihoodModel(
         library,
-        noise_floor=float(config.get("noise_floor", 4.0)),
-        pedestal_variance=float(config.get("pedestal_variance", 9.0)),
+        noise_floor=float(payload["noise_floor"]),
+        pedestal_variance=float(payload["pedestal_variance"]),
     )
-    bounds = _default_bounds(template_dataset)
+    bounds = [
+        (float(lo), float(hi)) for lo, hi in payload["bounds"]
+    ]
+    return model, bounds
 
-    test_txt = Path(config["test_txt_file"]).expanduser().resolve()
-    test_csv = _matching_csv_path(test_txt)
-    test_dataset = TAIGADataset(test_txt, test_csv)
 
-    seed = config.get("random_seed")
-    rng = random.Random(seed)
-    n_samples = int(config.get("n_samples", 4096))
-    refine_iterations = int(config.get("refine_iterations", 4))
-    refine_radius = float(config.get("refine_radius", 0.1))
-    test_limit = config.get("test_event_limit")
+def reconstruct_dataset(
+    model: LikelihoodModel,
+    bounds: Sequence[Tuple[float, float]],
+    dataset: TAIGADataset,
+    *,
+    rng: Optional[random.Random] = None,
+    n_samples: int = 4096,
+    refine_iterations: int = 4,
+    refine_radius: float = 0.1,
+    limit: Optional[int] = None,
+) -> List[Dict[str, float]]:
+    """Reconstruct parameters for ``dataset`` using a pre-trained model."""
 
+    if rng is None:
+        rng = random.Random()
+
+    max_events = None if limit is None else max(0, int(limit))
     results: List[Dict[str, float]] = []
-    for index, (event, truth) in enumerate(zip(test_dataset.events, test_dataset.parameters)):
-        if test_limit is not None and index >= int(test_limit):
+    for index, (event, truth) in enumerate(zip(dataset.events, dataset.parameters)):
+        if max_events is not None and index >= max_events:
             break
+
         best_params_local, best_ll = model.maximise(
             event,
             bounds=bounds,
@@ -651,7 +759,9 @@ def run_reconstruction_from_config(config_path: Path) -> List[Dict[str, float]]:
         )
 
         x_local, y_local, energy, xmax, source_tet, source_fi_local = best_params_local
-        x_global, y_global = EventParameters.ground_from_local(x_local, y_local, truth.tel_fi)
+        x_global, y_global = EventParameters.ground_from_local(
+            x_local, y_local, truth.tel_fi
+        )
         source_fi_global = EventParameters.source_fi_from_local(
             source_fi_local, truth.tel_fi
         )
@@ -675,6 +785,83 @@ def run_reconstruction_from_config(config_path: Path) -> List[Dict[str, float]]:
                 "tel_fi": float(truth.tel_fi),
             }
         )
+
+    return results
+
+
+def run_reconstruction_from_config(config_path: Path) -> List[Dict[str, float]]:
+    """Run the likelihood reconstruction described by ``config_path``.
+
+    The configuration is a JSON object whose keys mirror the ones documented in
+    ``README.md``.  On the first invocation the template library is assembled
+    from the listed dumps, the likelihood model is trained, and both are cached
+    to ``model_path``.  Later calls reuse the cached model unless
+    ``force_rebuild`` is requested.  Limits such as ``template_event_limit`` and
+    ``test_event_limit`` remain optional and default to loading every available
+    event.  ``max_templates`` caps the number of neighbours used for
+    inverse-distance weighting inside the :class:`TemplateLibrary`; keep it at a
+    manageable value to avoid diluting the influence of the closest templates
+    when very large template collections are supplied.
+
+    Returns
+    -------
+    list of dict
+        Reconstructed parameters and their ground-truth labels for every
+        processed test event.
+    """
+
+    config = load_configuration(config_path)
+    model_path = Path(config["model_path"]).expanduser().resolve()
+    force_rebuild = bool(config.get("force_rebuild", False))
+
+    model: LikelihoodModel
+    bounds: List[Tuple[float, float]]
+
+    if model_path.exists() and not force_rebuild:
+        model, bounds = load_model_package(model_path)
+    else:
+        template_paths = list(
+            _iter_template_paths(
+                config["template_txt_files"]  # type: ignore[arg-type]
+            )
+        )
+        template_limit = config.get("template_event_limit")
+        template_dataset = _load_datasets(template_paths, limit=template_limit)
+
+        library = TemplateLibrary(
+            template_dataset,
+            idw_power=float(config.get("idw_power", 2.0)),
+            max_templates=int(config.get("max_templates", 64)),
+        )
+        model = LikelihoodModel(
+            library,
+            noise_floor=float(config.get("noise_floor", 4.0)),
+            pedestal_variance=float(config.get("pedestal_variance", 9.0)),
+        )
+        bounds = _default_bounds(template_dataset)
+        save_model_package(model, bounds, model_path)
+
+    test_txt = Path(config["test_txt_file"]).expanduser().resolve()
+    test_csv = _matching_csv_path(test_txt)
+    test_dataset = TAIGADataset(test_txt, test_csv)
+
+    seed = config.get("random_seed")
+    rng = random.Random(seed)
+    n_samples = int(config.get("n_samples", 4096))
+    refine_iterations = int(config.get("refine_iterations", 4))
+    refine_radius = float(config.get("refine_radius", 0.1))
+    test_limit = config.get("test_event_limit")
+
+    results = reconstruct_dataset(
+        model,
+        bounds,
+        test_dataset,
+        rng=rng,
+        n_samples=n_samples,
+        refine_iterations=refine_iterations,
+        refine_radius=refine_radius,
+        limit=test_limit,
+    )
 
     output_csv = Path(config["output_csv"]).expanduser().resolve()
     output_csv.parent.mkdir(parents=True, exist_ok=True)

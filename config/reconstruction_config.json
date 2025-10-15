@@ -2,13 +2,14 @@
   "template_txt_files": [
     "data/taiga607_clean_iact01_14_7fix_cb0.txt"
   ],
-  "template_event_limit": 128,
+  "template_event_limit": null,
   "test_txt_file": "data/taiga607_clean_iact01_14_7fix_cb0.txt",
-  "test_event_limit": 32,
+  "test_event_limit": null,
   "output_csv": "data/reconstruction_results.csv",
+  "model_path": "data/likelihood_model.pkl",
   "random_seed": 1,
-  "n_samples": 16,
-  "max_templates": 16,
-  "refine_iterations": 2,
-  "refine_radius": 0.05
+  "n_samples": 2048,
+  "max_templates": 128,
+  "refine_iterations": 4,
+  "refine_radius": 0.08
 }
