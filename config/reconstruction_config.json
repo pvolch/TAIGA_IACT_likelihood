@@ -1,0 +1,14 @@
+{
+  "template_txt_files": [
+    "data/taiga607_clean_iact01_14_7fix_cb0.txt"
+  ],
+  "template_event_limit": 128,
+  "test_txt_file": "data/taiga607_clean_iact01_14_7fix_cb0.txt",
+  "test_event_limit": 32,
+  "output_csv": "data/reconstruction_results.csv",
+  "random_seed": 1,
+  "n_samples": 16,
+  "max_templates": 16,
+  "refine_iterations": 2,
+  "refine_radius": 0.05
+}
