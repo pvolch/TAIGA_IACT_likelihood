@@ -15,7 +15,10 @@ Workflow summary
 
 * Parse the ``*_clean_*.txt`` file to obtain sparse camera images.
 * Parse the matching ``*_hillas_*.csv`` file to obtain the ground truth
-  parameters ``(x_ground, y_ground, energy, Xmax, source_tet)``.
+  parameters.
+* Rotate the ground impact point and arrival azimuth into the telescope
+  reference frame to remove the dependence on the azimuthal pointing
+  angle.
 * Build a :class:`TemplateLibrary` that stores the cleaned images and the
   associated parameters.
 * Use inverse distance weighting in the parameter space to interpolate an
@@ -25,19 +28,19 @@ Workflow summary
   optimiser searches for the parameter set that maximises that
   likelihood.
 
-The implementation exposes both a Python API and a small command line
-interface.  Run ``python TAIGA_IACT_likelihood.py --help`` for an
-overview of the available options.
+The module is designed to be driven through configuration files instead
+of a command line interface.  See :func:`run_reconstruction_from_config`
+for the high level entry point used in the repository notebooks.
 """
 from __future__ import annotations
 
-import argparse
 import csv
+import json
 import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 __all__ = [
     "PixelMeasurement",
@@ -47,6 +50,8 @@ __all__ = [
     "TemplateLibrary",
     "LikelihoodModel",
     "estimate_event_parameters",
+    "load_configuration",
+    "run_reconstruction_from_config",
 ]
 
 Vector = List[float]
@@ -84,8 +89,9 @@ class EventImage:
             vector = [0.0] * indexer.size
             for pixel in self.pixels:
                 key = (pixel.cluster_id, pixel.pixel_id)
-                idx = indexer.lookup[key]
-                vector[idx] = pixel.amplitude
+                idx = indexer.lookup.get(key)
+                if idx is not None:
+                    vector[idx] = pixel.amplitude
             self._vector_cache[cache_key] = vector
         stored = self._vector_cache[cache_key]
         return list(stored)
@@ -100,15 +106,54 @@ class EventParameters:
     energy: float
     xmax: float
     source_tet: float
+    tel_fi: float
+    source_fi: float
 
-    def as_list(self) -> Vector:
+    def local_ground_coordinates(self) -> Tuple[float, float]:
+        """Return the ground impact point in the telescope frame."""
+
+        cos_fi = math.cos(self.tel_fi)
+        sin_fi = math.sin(self.tel_fi)
+        x_local = self.x_ground * cos_fi + self.y_ground * sin_fi
+        y_local = -self.x_ground * sin_fi + self.y_ground * cos_fi
+        return x_local, y_local
+
+    def local_source_fi(self) -> float:
+        """Return the arrival azimuth in the telescope frame."""
+
+        return wrap_angle(self.source_fi - self.tel_fi)
+
+    def template_vector(self) -> Vector:
+        local_x, local_y = self.local_ground_coordinates()
         return [
-            float(self.x_ground),
-            float(self.y_ground),
+            float(local_x),
+            float(local_y),
             float(self.energy),
             float(self.xmax),
             float(self.source_tet),
+            float(self.local_source_fi()),
         ]
+
+    @staticmethod
+    def ground_from_local(
+        x_local: float, y_local: float, tel_fi: float
+    ) -> Tuple[float, float]:
+        cos_fi = math.cos(tel_fi)
+        sin_fi = math.sin(tel_fi)
+        x_global = x_local * cos_fi - y_local * sin_fi
+        y_global = x_local * sin_fi + y_local * cos_fi
+        return x_global, y_global
+
+    @staticmethod
+    def source_fi_from_local(local_source_fi: float, tel_fi: float) -> float:
+        return wrap_angle(local_source_fi + tel_fi)
+
+
+def wrap_angle(value: float) -> float:
+    """Map angles to the interval ``[-pi, pi)``."""
+
+    value = (value + math.pi) % (2.0 * math.pi)
+    return value - math.pi
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +220,15 @@ def read_event_parameters(path: Path) -> List[EventParameters]:
 
     with path.open("r", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
-        required = ["x_ground", "y_ground", "energy", "Xmax", "source_tet"]
+        required = [
+            "x_ground",
+            "y_ground",
+            "energy",
+            "Xmax",
+            "source_tet",
+            "tel_fi",
+            "source_fi",
+        ]
         for column in required:
             if column not in reader.fieldnames:
                 raise ValueError(
@@ -190,6 +243,8 @@ def read_event_parameters(path: Path) -> List[EventParameters]:
                     energy=float(row["energy"]),
                     xmax=float(row["Xmax"]),
                     source_tet=float(row["source_tet"]),
+                    tel_fi=float(row["tel_fi"]),
+                    source_fi=float(row["source_fi"]),
                 )
             )
     return params
@@ -235,6 +290,7 @@ class TAIGADataset:
 
         self.events = events
         self.parameters = parameters
+        self.template_vectors = [params.template_vector() for params in parameters]
         self.pixel_indexer = PixelIndexer(events)
 
     def __len__(self) -> int:
@@ -250,6 +306,7 @@ class TAIGADataset:
         dataset.parameters = [
             params for idx, params in enumerate(self.parameters) if idx != index
         ]
+        dataset.template_vectors = [p.template_vector() for p in dataset.parameters]
         dataset.pixel_indexer = PixelIndexer(dataset.events)
         return dataset
 
@@ -283,7 +340,7 @@ class TemplateLibrary:
             event.to_vector(self.indexer) for event in dataset.events
         ]
         self.parameters: List[Vector] = [
-            params.as_list() for params in dataset.parameters
+            vector[:] for vector in dataset.template_vectors
         ]
 
         # Parameter-wise scale factors to normalise the distance metric.
@@ -293,15 +350,19 @@ class TemplateLibrary:
             for idx, value in enumerate(param_vector):
                 minima[idx] = min(minima[idx], value)
                 maxima[idx] = max(maxima[idx], value)
-        self.parameter_scales = [
-            max(maxima[idx] - minima[idx], 1.0) for idx in range(5)
-        ]
+        scales: List[float] = []
+        for idx in range(len(minima)):
+            if idx == 5:
+                scales.append(math.pi)
+            else:
+                scales.append(max(maxima[idx] - minima[idx], 1.0))
+        self.parameter_scales = scales
 
     def interpolate(self, params: Vector) -> Tuple[Vector, Vector]:
-        if len(params) != 5:
+        if len(params) != len(self.parameter_scales):
             raise ValueError(
-                "Parameter vector must contain five entries:"
-                " (x_ground, y_ground, energy, Xmax, source_tet)"
+                "Parameter vector must contain six entries:"
+                " (x_local, y_local, energy, Xmax, source_tet, source_fi_local)"
             )
 
         # Compute distances to all templates and retain only the closest ones.
@@ -309,10 +370,14 @@ class TemplateLibrary:
 
         candidates: List[Tuple[float, int]] = []
         for idx, vector in enumerate(self.parameters):
-            deltas = [
-                (component - params[idx]) / self.parameter_scales[idx]
-                for idx, component in enumerate(vector)
-            ]
+            deltas = []
+            for axis, component in enumerate(vector):
+                scale = self.parameter_scales[axis]
+                if axis == 5:
+                    delta = wrap_angle(component - params[axis]) / scale
+                else:
+                    delta = (component - params[axis]) / scale
+                deltas.append(delta)
             distance = max(_vector_norm(deltas), 1e-6)
             candidates.append((distance, idx))
 
@@ -382,8 +447,8 @@ class LikelihoodModel:
         refine_iterations: int = 4,
         refine_radius: float = 0.1,
     ) -> Tuple[Vector, float]:
-        if len(bounds) != 5:
-            raise ValueError("Bounds must define five (min, max) pairs")
+        if len(bounds) != 6:
+            raise ValueError("Bounds must define six (min, max) pairs")
         lows = [float(lo) for lo, _ in bounds]
         highs = [float(hi) for _, hi in bounds]
         spans = [hi - lo for lo, hi in bounds]
@@ -426,7 +491,7 @@ class LikelihoodModel:
 
 
 def _default_bounds(dataset: TAIGADataset) -> List[Tuple[float, float]]:
-    params = [p.as_list() for p in dataset.parameters]
+    params = [vector[:] for vector in dataset.template_vectors]
     minima = params[0][:]
     maxima = params[0][:]
     for vector in params[1:]:
@@ -434,7 +499,7 @@ def _default_bounds(dataset: TAIGADataset) -> List[Tuple[float, float]]:
             minima[idx] = min(minima[idx], value)
             maxima[idx] = max(maxima[idx], value)
 
-    margins = [100.0, 100.0, 10.0, 50.0, math.radians(1.0)]
+    margins = [100.0, 100.0, 10.0, 50.0, math.radians(1.0), math.radians(5.0)]
     minima = [m - margin for m, margin in zip(minima, margins)]
     maxima = [m + margin for m, margin in zip(maxima, margins)]
 
@@ -448,6 +513,8 @@ def _default_bounds(dataset: TAIGADataset) -> List[Tuple[float, float]]:
     maxima[3] = min(maxima[3], 900.0)
     minima[4] = max(minima[4], math.radians(25.0))
     maxima[4] = min(maxima[4], math.radians(45.0))
+    minima[5] = max(minima[5], -math.pi)
+    maxima[5] = min(maxima[5], math.pi)
 
     return list(zip(minima, maxima))
 
@@ -459,7 +526,7 @@ def estimate_event_parameters(
     leave_one_out: bool = True,
     rng: Optional[random.Random] = None,
     n_samples: int = 4096,
-) -> Tuple[Vector, float, Vector]:
+) -> Tuple[Vector, float, EventParameters]:
     if rng is None:
         rng = random.Random()
     if leave_one_out and len(dataset) > 1:
@@ -478,89 +545,162 @@ def estimate_event_parameters(
         n_samples=n_samples,
     )
 
-    true_params = dataset.parameters[event_index].as_list()
+    true_params = dataset.parameters[event_index]
     return best_params, best_ll, true_params
 
 
-# ---------------------------------------------------------------------------
-# Command line interface
-# ---------------------------------------------------------------------------
+def _matching_csv_path(txt_path: Path) -> Path:
+    stem = txt_path.name
+    if "_clean_" not in stem:
+        raise ValueError(
+            f"Cannot derive CSV filename from {txt_path!s}: missing '_clean_' marker"
+        )
+    csv_name = stem.replace("_clean_", "_hillas_")
+    csv_name = csv_name.rsplit(".", 1)[0] + ".csv"
+    return txt_path.with_name(csv_name)
 
 
-def _format_params(params: Sequence[float]) -> str:
-    return (
-        "x_ground={:.2f} m, y_ground={:.2f} m, energy={:.2f} TeV, "
-        "Xmax={:.2f} g/cm^2, source_tet={:.2f} rad"
-    ).format(*params)
+def _load_datasets(
+    paths: Sequence[Path], limit: Optional[int] = None
+) -> TAIGADataset:
+    paths = list(paths)
+    if not paths:
+        raise ValueError("At least one template file must be provided")
+
+    events: List[EventImage] = []
+    parameters: List[EventParameters] = []
+    for txt_path in paths:
+        csv_path = _matching_csv_path(txt_path)
+        dataset = TAIGADataset(txt_path, csv_path)
+        events.extend(dataset.events)
+        parameters.extend(dataset.parameters)
+
+    if limit is not None:
+        limit = max(0, int(limit))
+        events = events[:limit]
+        parameters = parameters[:limit]
+
+    combined = TAIGADataset.__new__(TAIGADataset)  # type: ignore[misc]
+    combined.events = events
+    combined.parameters = parameters
+    combined.template_vectors = [p.template_vector() for p in parameters]
+    combined.pixel_indexer = PixelIndexer(events)
+    return combined
 
 
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Likelihood-based parameter estimation for TAIGA events",
-    )
-    parser.add_argument(
-        "--txt",
-        type=Path,
-        default=Path("data/taiga607_clean_iact01_14_7fix_cb0.txt"),
-        help="Path to the cleaned event dump (*.txt)",
-    )
-    parser.add_argument(
-        "--csv",
-        type=Path,
-        default=Path("data/taiga607_hillas_iact01_14_7fix_cb0.csv"),
-        help="Path to the matching parameter table (*.csv)",
-    )
-    parser.add_argument(
-        "--event-index",
-        type=int,
-        default=0,
-        help="Index of the event to reconstruct",
-    )
-    parser.add_argument(
-        "--samples",
-        type=int,
-        default=4096,
-        help="Number of random samples used during optimisation",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=None,
-        help="Seed for the internal random number generator",
-    )
-    parser.add_argument(
-        "--keep-template",
-        action="store_true",
-        help="Do not remove the target event from the template library",
-    )
-    return parser
+def load_configuration(path: Path) -> Dict[str, object]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    required = ["template_txt_files", "test_txt_file", "output_csv"]
+    for key in required:
+        if key not in payload:
+            raise ValueError(f"Configuration missing required key {key!r}")
+    return payload
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
+def _iter_template_paths(entries: Iterable[str]) -> Iterator[Path]:
+    for entry in entries:
+        path = Path(entry).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Template file not found: {path}")
+        yield path
 
-    dataset = TAIGADataset(args.txt, args.csv)
-    if args.event_index < 0 or args.event_index >= len(dataset):
-        raise SystemExit(
-            f"Event index {args.event_index} out of range (0..{len(dataset)-1})"
+
+def run_reconstruction_from_config(config_path: Path) -> List[Dict[str, float]]:
+    config = load_configuration(config_path)
+    template_paths = list(
+        _iter_template_paths(config["template_txt_files"])  # type: ignore[arg-type]
+    )
+    template_limit = config.get("template_event_limit")
+    template_dataset = _load_datasets(template_paths, limit=template_limit)
+
+    library = TemplateLibrary(
+        template_dataset,
+        idw_power=float(config.get("idw_power", 2.0)),
+        max_templates=int(config.get("max_templates", 64)),
+    )
+    model = LikelihoodModel(
+        library,
+        noise_floor=float(config.get("noise_floor", 4.0)),
+        pedestal_variance=float(config.get("pedestal_variance", 9.0)),
+    )
+    bounds = _default_bounds(template_dataset)
+
+    test_txt = Path(config["test_txt_file"]).expanduser().resolve()
+    test_csv = _matching_csv_path(test_txt)
+    test_dataset = TAIGADataset(test_txt, test_csv)
+
+    seed = config.get("random_seed")
+    rng = random.Random(seed)
+    n_samples = int(config.get("n_samples", 4096))
+    refine_iterations = int(config.get("refine_iterations", 4))
+    refine_radius = float(config.get("refine_radius", 0.1))
+    test_limit = config.get("test_event_limit")
+
+    results: List[Dict[str, float]] = []
+    for index, (event, truth) in enumerate(zip(test_dataset.events, test_dataset.parameters)):
+        if test_limit is not None and index >= int(test_limit):
+            break
+        best_params_local, best_ll = model.maximise(
+            event,
+            bounds=bounds,
+            rng=rng,
+            n_samples=n_samples,
+            refine_iterations=refine_iterations,
+            refine_radius=refine_radius,
         )
 
-    rng = random.Random(args.seed)
-    best_params, best_ll, true_params = estimate_event_parameters(
-        dataset,
-        event_index=args.event_index,
-        leave_one_out=not args.keep_template,
-        rng=rng,
-        n_samples=args.samples,
-    )
+        x_local, y_local, energy, xmax, source_tet, source_fi_local = best_params_local
+        x_global, y_global = EventParameters.ground_from_local(x_local, y_local, truth.tel_fi)
+        source_fi_global = EventParameters.source_fi_from_local(
+            source_fi_local, truth.tel_fi
+        )
 
-    print("Selected event:", args.event_index)
-    print("True parameters:", _format_params(true_params))
-    print("Estimated parameters:", _format_params(best_params))
-    print("Log-likelihood at optimum: {:.3f}".format(best_ll))
-    return 0
+        results.append(
+            {
+                "event_index": float(index),
+                "log_likelihood": float(best_ll),
+                "x_ground_est": float(x_global),
+                "y_ground_est": float(y_global),
+                "energy_est": float(energy),
+                "xmax_est": float(xmax),
+                "source_tet_est": float(source_tet),
+                "source_fi_est": float(source_fi_global),
+                "x_ground_true": float(truth.x_ground),
+                "y_ground_true": float(truth.y_ground),
+                "energy_true": float(truth.energy),
+                "xmax_true": float(truth.xmax),
+                "source_tet_true": float(truth.source_tet),
+                "source_fi_true": float(truth.source_fi),
+                "tel_fi": float(truth.tel_fi),
+            }
+        )
 
+    output_csv = Path(config["output_csv"]).expanduser().resolve()
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "event_index",
+                "log_likelihood",
+                "x_ground_est",
+                "y_ground_est",
+                "energy_est",
+                "xmax_est",
+                "source_tet_est",
+                "source_fi_est",
+                "x_ground_true",
+                "y_ground_true",
+                "energy_true",
+                "xmax_true",
+                "source_tet_true",
+                "source_fi_true",
+                "tel_fi",
+            ],
+        )
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
 
-if __name__ == "__main__":  # pragma: no cover - CLI entry point
-    raise SystemExit(main())
+    return results
