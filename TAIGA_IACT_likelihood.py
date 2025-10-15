@@ -1,1080 +1,949 @@
 #!/usr/bin/env python3
+"""TAIGA IACT likelihood estimation utilities.
+
+This module offers a compact template-based likelihood estimator that can
+operate directly on the event dumps contained in this repository.  The
+original CTA ``ImPACT`` implementation depends on heavy external
+packages (``ctapipe``, large template libraries, ...).  For the TAIGA
+use-case we provide a pure-Python alternative that only relies on the
+standard library.  The code is intentionally lightweight to keep the
+dependencies manageable while still offering a practical baseline for
+parameter estimation.
+
+Workflow summary
+================
+
+* Parse the ``*_clean_*.txt`` file to obtain sparse camera images.
+* Parse the matching ``*_hillas_*.csv`` file to obtain the ground truth
+  parameters.
+* Rotate the ground impact point and arrival azimuth into the telescope
+  reference frame to remove the dependence on the azimuthal pointing
+  angle.
+* Build a :class:`TemplateLibrary` that stores the cleaned images and the
+  associated parameters.
+* Use inverse distance weighting in the parameter space to interpolate an
+  expected image for arbitrary parameter values.
+* Compare the interpolated template with the observation under a
+  Gaussian noise model to obtain a log-likelihood.  A crude stochastic
+  optimiser searches for the parameter set that maximises that
+  likelihood.
+
+The module is designed to be driven through configuration files instead
+of a command line interface.  See :func:`run_reconstruction_from_config`
+for the high level entry point used in the repository notebooks.
 """
-Implementation of the ImPACT reconstruction algorithm
-"""
-import copy
-from string import Template
+from __future__ import annotations
 
-import numpy as np
-import numpy.ma as ma
-from astropy import units as u
-from astropy.coordinates import AltAz, SkyCoord
-from scipy.stats import norm
+import csv
+import json
+import math
+import os
+import pickle
+import random
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-from ctapipe.core import traits
-from ctapipe.exceptions import OptionalDependencyMissing
-
-from ..compat import COPY_IF_NEEDED
-from ..containers import ReconstructedEnergyContainer, ReconstructedGeometryContainer
-from ..coordinates import (
-    CameraFrame,
-    GroundFrame,
-    NominalFrame,
-    TiltedGroundFrame,
-    project_to_ground,
-)
-from ..core import Provenance
-from ..fitting import lts_linear_regression
-from ..image.cleaning import dilate
-from ..image.pixel_likelihood import (
-    mean_poisson_likelihood_gaussian,
-    neg_log_likelihood_approx,
-)
-from ..utils.template_network_interpolator import (
-    DummyTemplateInterpolator,
-    DummyTimeInterpolator,
-    TemplateNetworkInterpolator,
-    TimeGradientInterpolator,
-)
-from .impact_utilities import (
-    EmptyImages,
-    create_seed,
-    guess_shower_depth,
-    rotate_translate,
-)
-from .reconstructor import (
-    HillasGeometryReconstructor,
-    InvalidWidthException,
-    ReconstructionProperty,
-    TooFewTelescopesException,
+DEFAULT_CONFIG_ENV = "TAIGA_LIKELIHOOD_CONFIG"
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config").joinpath(
+    "reconstruction_config.json"
 )
 
-try:
-    from iminuit import Minuit
-except ModuleNotFoundError:
-    Minuit = None
+__all__ = [
+    "PixelMeasurement",
+    "EventImage",
+    "EventParameters",
+    "TAIGADataset",
+    "TemplateLibrary",
+    "LikelihoodModel",
+    "load_model_package",
+    "reconstruct_dataset",
+    "save_model_package",
+    "estimate_event_parameters",
+    "load_configuration",
+    "run_reconstruction_from_config",
+]
 
-PROV = Provenance()
-
-INVALID_GEOMETRY = ReconstructedGeometryContainer(
-    telescopes=[],
-    prefix="ImPACTReconstructor",
-)
-
-INVALID_ENERGY = ReconstructedEnergyContainer(
-    prefix="ImPACTReconstructor",
-    telescopes=[],
-)
-
-# These are settings for the iminuit minimizer
-MINUIT_ERRORDEF = 0.5  # 0.5 for a log-likelihood cost function for correct errors
-MINUIT_STRATEGY = 1  # Default minimization strategy, 2 is careful, 0 is fast
-MINUIT_TOLERANCE_FACTOR = 1000  # Tolerance for convergence according to EDM criterion
-MIGRAD_ITERATE = 1  # Do not call migrad again if convergence was not reached
-__all__ = ["ImPACTReconstructor"]
+Vector = List[float]
 
 
+# ---------------------------------------------------------------------------
+# Data containers
+# ---------------------------------------------------------------------------
 
-[docs]
-class ImPACTReconstructor(HillasGeometryReconstructor):
-    """This class is an implementation if the impact_reco Monte Carlo
-    Template based image fitting method from parsons14.  This method uses a
-    comparison of the predicted image from a library of image
-    templates to perform a maximum likelihood fit for the shower axis,
-    energy and height of maximum.
 
-    Besides the image information, there is also the option to use the time gradient of the pixels
-    across the image as additional information in the fit. This requires an additional set of templates
+@dataclass(frozen=True)
+class PixelMeasurement:
+    """Single cleaned pixel measurement."""
 
-    Because this application is computationally intensive the usual
-    advice to use astropy units for all quantities is ignored (as
-    these slow down some computations), instead units within the class
-    are fixed:
+    cluster_id: int
+    pixel_id: int
+    x: float
+    y: float
+    amplitude: float
 
-    - Angular units in radians
-    - Distance units in metres
-    - Energy units in TeV
 
-    Parameters
-    ----------
-    subarray : ctapipe.instrument.SubarrayDescription
-        The telescope subarray to use for reconstruction
-    atmosphere_profile : ctapipe.atmosphere.AtmosphereDensityProfile
-        Density vs. altitude profile of the local atmosphere
-    dummy_reconstructor : bool, optional
-        Option to use a set of dummy templates. This can be used for testing the algorithm,
-        but for any actual reconstruction should be set to its default False
+@dataclass
+class EventImage:
+    """Collection of pixel measurements belonging to one event."""
 
-    References
-    ----------
-    .. [parsons14] Parsons & Hinton, Astroparticle Physics 56 (2014), pp. 26-34
+    header: Vector
+    pixels: List[PixelMeasurement]
+    _vector_cache: Dict[int, Vector] = None  # filled lazily
 
-    """
+    def to_vector(self, indexer: "PixelIndexer") -> Vector:
+        cache_key = id(indexer.lookup)
+        if self._vector_cache is None:
+            self._vector_cache = {}
+        if cache_key not in self._vector_cache:
+            vector = [0.0] * indexer.size
+            for pixel in self.pixels:
+                key = (pixel.cluster_id, pixel.pixel_id)
+                idx = indexer.lookup.get(key)
+                if idx is not None:
+                    vector[idx] = pixel.amplitude
+            self._vector_cache[cache_key] = vector
+        stored = self._vector_cache[cache_key]
+        return list(stored)
 
-    use_time_gradient = traits.Bool(
-        default_value=False,
-        help="Use time gradient in ImPACT reconstruction. Requires an extra set of time gradient templates",
-    ).tag(config=True)
 
-    root_dir = traits.Unicode(
-        default_value=".", help="Directory containing ImPACT tables"
-    ).tag(config=True)
+@dataclass(frozen=True)
+class EventParameters:
+    """Ground truth parameters associated with one event."""
 
-    # For likelihood calculation we need the with of the
-    # pedestal distribution for each pixel
-    # currently this is not available from the calibration,
-    # so for now lets hard code it in a dict
-    ped_table = {
-        "LSTCam": 1.4,
-        "NectarCam": 1.3,
-        "FlashCam": 1.3,
-        "SST-Camera": 0.5,
-        "CHEC": 0.5,
-        "ASTRICam": 0.5,
-        "dummy": 0.01,
-        "UNKNOWN-960PX": 1.0,
-    }
-    spe = 0.6  # Also hard code single p.e. distribution width
+    x_ground: float
+    y_ground: float
+    energy: float
+    xmax: float
+    source_tet: float
+    tel_fi: float
+    source_fi: float
 
-    property = ReconstructionProperty.ENERGY | ReconstructionProperty.GEOMETRY
+    def local_ground_coordinates(self) -> Tuple[float, float]:
+        """Return the ground impact point in the telescope frame."""
+
+        cos_fi = math.cos(self.tel_fi)
+        sin_fi = math.sin(self.tel_fi)
+        x_local = self.x_ground * cos_fi + self.y_ground * sin_fi
+        y_local = -self.x_ground * sin_fi + self.y_ground * cos_fi
+        return x_local, y_local
+
+    def local_source_fi(self) -> float:
+        """Return the arrival azimuth in the telescope frame."""
+
+        return wrap_angle(self.source_fi - self.tel_fi)
+
+    def template_vector(self) -> Vector:
+        local_x, local_y = self.local_ground_coordinates()
+        return [
+            float(local_x),
+            float(local_y),
+            float(self.energy),
+            float(self.xmax),
+            float(self.source_tet),
+            float(self.local_source_fi()),
+        ]
+
+    @staticmethod
+    def ground_from_local(
+        x_local: float, y_local: float, tel_fi: float
+    ) -> Tuple[float, float]:
+        cos_fi = math.cos(tel_fi)
+        sin_fi = math.sin(tel_fi)
+        x_global = x_local * cos_fi - y_local * sin_fi
+        y_global = x_local * sin_fi + y_local * cos_fi
+        return x_global, y_global
+
+    @staticmethod
+    def source_fi_from_local(local_source_fi: float, tel_fi: float) -> float:
+        return wrap_angle(local_source_fi + tel_fi)
+
+
+def wrap_angle(value: float) -> float:
+    """Map angles to the interval ``[-pi, pi)``."""
+
+    value = (value + math.pi) % (2.0 * math.pi)
+    return value - math.pi
+
+
+# ---------------------------------------------------------------------------
+# Parsing utilities
+# ---------------------------------------------------------------------------
+
+
+def _parse_event_header(header_line: str) -> Tuple[Vector, int]:
+    values = [float(x) for x in header_line.split()]
+    if len(values) < 4:
+        raise ValueError(
+            f"Malformed event header (expected >=4 values): {header_line!r}"
+        )
+    pixel_count = int(values[3])
+    if pixel_count < 0:
+        raise ValueError(f"Negative pixel count encountered: {pixel_count}")
+    return values, pixel_count
+
+
+def _parse_pixel_measurement(line: str) -> PixelMeasurement:
+    parts = line.split()
+    if len(parts) != 5:
+        raise ValueError(
+            "Malformed pixel line: expected five entries (cluster, pixel, x, y,"
+            f" amplitude) but got {len(parts)} in line {line!r}"
+        )
+    return PixelMeasurement(
+        cluster_id=int(parts[0]),
+        pixel_id=int(parts[1]),
+        x=float(parts[2]),
+        y=float(parts[3]),
+        amplitude=float(parts[4]),
+    )
+
+
+def read_event_images(path: Path) -> List[EventImage]:
+    """Parse a ``*_clean_*.txt`` file into :class:`EventImage` objects."""
+
+    events: List[EventImage] = []
+    with path.open("r", encoding="utf-8") as handle:
+        lines = [line.strip() for line in handle if line.strip()]
+
+    cursor = 0
+    total_lines = len(lines)
+    while cursor < total_lines:
+        header, n_pixels = _parse_event_header(lines[cursor])
+        cursor += 1
+        if cursor + n_pixels > total_lines:
+            raise ValueError(
+                "Unexpected end of file when reading pixel data for an event"
+            )
+        pixels = [
+            _parse_pixel_measurement(lines[cursor + offset])
+            for offset in range(n_pixels)
+        ]
+        events.append(EventImage(header=header, pixels=pixels))
+        cursor += n_pixels
+
+    return events
+
+
+def read_event_parameters(path: Path) -> List[EventParameters]:
+    """Parse the matching ``*_hillas_*.csv`` file."""
+
+    with path.open("r", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        required = [
+            "x_ground",
+            "y_ground",
+            "energy",
+            "Xmax",
+            "source_tet",
+            "tel_fi",
+            "source_fi",
+        ]
+        for column in required:
+            if column not in reader.fieldnames:
+                raise ValueError(
+                    f"CSV file is missing required column {column!r}"
+                )
+        params: List[EventParameters] = []
+        for row in reader:
+            params.append(
+                EventParameters(
+                    x_ground=float(row["x_ground"]),
+                    y_ground=float(row["y_ground"]),
+                    energy=float(row["energy"]),
+                    xmax=float(row["Xmax"]),
+                    source_tet=float(row["source_tet"]),
+                    tel_fi=float(row["tel_fi"]),
+                    source_fi=float(row["source_fi"]),
+                )
+            )
+    return params
+
+
+# ---------------------------------------------------------------------------
+# Dataset representation
+# ---------------------------------------------------------------------------
+
+
+class PixelIndexer:
+    """Utility that maps ``(cluster_id, pixel_id)`` pairs to indices."""
+
+    def __init__(self, events: Sequence[EventImage]):
+        lookup: Dict[Tuple[int, int], int] = {}
+        positions: List[Tuple[float, float]] = []
+        for event in events:
+            for pixel in event.pixels:
+                key = (pixel.cluster_id, pixel.pixel_id)
+                if key not in lookup:
+                    lookup[key] = len(lookup)
+                    positions.append((pixel.x, pixel.y))
+        self.lookup = lookup
+        self.positions = positions
+        self.size = len(lookup)
+
+
+class TAIGADataset:
+    """Container that bundles event images with their parameters."""
+
+    def __init__(self, txt_path: Path, csv_path: Path):
+        if not txt_path.exists():
+            raise FileNotFoundError(f"Event text file not found: {txt_path}")
+        if not csv_path.exists():
+            raise FileNotFoundError(f"Parameter csv file not found: {csv_path}")
+
+        events = read_event_images(txt_path)
+        parameters = read_event_parameters(csv_path)
+        if len(events) != len(parameters):
+            raise ValueError(
+                f"Text / CSV event count mismatch: {len(events)} vs {len(parameters)}"
+            )
+
+        self.events = events
+        self.parameters = parameters
+        self.template_vectors = [params.template_vector() for params in parameters]
+        self.pixel_indexer = PixelIndexer(events)
+
+    def __len__(self) -> int:
+        return len(self.events)
+
+    def leave_one_out(self, index: int) -> "TAIGADataset":
+        if index < 0 or index >= len(self.events):
+            raise IndexError(f"Event index {index} out of range")
+        dataset = TAIGADataset.__new__(TAIGADataset)  # type: ignore[misc]
+        dataset.events = [
+            event for idx, event in enumerate(self.events) if idx != index
+        ]
+        dataset.parameters = [
+            params for idx, params in enumerate(self.parameters) if idx != index
+        ]
+        dataset.template_vectors = [p.template_vector() for p in dataset.parameters]
+        dataset.pixel_indexer = PixelIndexer(dataset.events)
+        return dataset
+
+
+# ---------------------------------------------------------------------------
+# Template interpolation
+# ---------------------------------------------------------------------------
+
+
+def _vector_norm(values: Iterable[float]) -> float:
+    return math.sqrt(sum(component * component for component in values))
+
+
+class TemplateLibrary:
+    """Interpolate between discrete template images using IDW."""
 
     def __init__(
-        self, subarray, atmosphere_profile, dummy_reconstructor=False, **kwargs
+        self,
+        dataset: TAIGADataset,
+        idw_power: float = 2.0,
+        max_templates: int = 64,
     ):
-        if Minuit is None:
-            raise OptionalDependencyMissing("iminuit") from None
+        if len(dataset) == 0:
+            raise ValueError("Cannot build a template library from an empty dataset")
+        self.dataset = dataset
+        self.idw_power = float(idw_power)
+        self.max_templates = int(max(1, max_templates))
+        self.indexer = dataset.pixel_indexer
 
-        if atmosphere_profile is None:
-            raise TypeError(
-                "Argument 'atmosphere_profile' can not be 'None' for ImPACTReconstructor"
-            )
+        self.templates: List[Vector] = [
+            event.to_vector(self.indexer) for event in dataset.events
+        ]
+        self.parameters: List[Vector] = [
+            vector[:] for vector in dataset.template_vectors
+        ]
 
-        super().__init__(subarray, atmosphere_profile, **kwargs)
-
-        # First we create a dictionary of image template interpolators
-        # for each telescope type
-        # self.priors = prior
-
-        # String templates for loading ImPACT templates
-        self.amplitude_template = Template("${base}/${camera}.template.gz")
-        self.time_template = Template("${base}/${camera}_time.template.gz")
-
-        # Next we need the position, area and amplitude from each pixel in the event
-        # making this a class member makes passing them around much easier
-
-        self.pixel_x, self.pixel_y = None, None
-        self.image, self.time = None, None
-
-        self.tel_types, self.tel_id = None, None
-
-        # We also need telescope positions
-        self.tel_pos_x, self.tel_pos_y = None, None
-
-        # And the peak of the images
-        self.peak_x, self.peak_y, self.peak_amp = None, None, None
-        self.hillas_parameters, self.ped = None, None
-
-        self.prediction = dict()
-        self.time_prediction = dict()
-
-        self.array_direction = None
-        self.nominal_frame = None
-
-        self.dummy_reconstructor = dummy_reconstructor
-
-
-[docs]
-    def __call__(self, event):
-        """
-        Perform the full shower geometry reconstruction on the input event.
-
-        Parameters
-        ----------
-        event : container
-            `ctapipe.containers.ArrayEventContainer`
-        """
-
-        try:
-            hillas_dict = self._create_hillas_dict(event)
-        except (TooFewTelescopesException, InvalidWidthException):
-            event.dl2.stereo.geometry[self.__class__.__name__] = INVALID_GEOMETRY
-            event.dl2.stereo.energy[self.__class__.__name__] = INVALID_ENERGY
-            self._store_impact_parameter(event)
-            return
-
-        # Due to tracking the pointing of the array will never be a constant
-        array_pointing = SkyCoord(
-            az=event.monitoring.pointing.array_azimuth,
-            alt=event.monitoring.pointing.array_altitude,
-            frame=AltAz(),
-        )
-
-        # And the pointing direction of the telescopes may not be the same
-        telescope_pointings = self._get_telescope_pointings(event)
-
-        # Finally get the telescope images and and the selection masks
-        mask_dict, image_dict, time_dict = {}, {}, {}
-        for tel_id in hillas_dict.keys():
-            image = event.dl1.tel[tel_id].image
-            image_dict[tel_id] = image
-            time_dict[tel_id] = event.dl1.tel[tel_id].peak_time
-            mask = event.dl1.tel[tel_id].image_mask
-
-            # Dilate the images around the original cleaning to help the fit
-            for _ in range(3):
-                mask = dilate(self.subarray.tel[tel_id].camera.geometry, mask)
-
-            mask_dict[tel_id] = mask
-
-        # Next, we look for geometry and energy seeds from previously applied reconstructors.
-        # Both need to be present at elast once for ImPACT to run.
-
-        reco_geom_pred = event.dl2.stereo.geometry
-
-        valid_geometry_seed = False
-        for geom_pred in reco_geom_pred.values():
-            if geom_pred.is_valid:
-                valid_geometry_seed = True
-                break
-
-        reco_energy_pred = event.dl2.stereo.energy
-
-        valid_energy_seed = False
-        for E_pred in reco_energy_pred.values():
-            if E_pred.is_valid:
-                valid_energy_seed = True
-                break
-
-        if valid_geometry_seed is False or valid_energy_seed is False:
-            event.dl2.stereo.geometry[self.__class__.__name__] = INVALID_GEOMETRY
-            event.dl2.stereo.energy[self.__class__.__name__] = INVALID_ENERGY
-            self._store_impact_parameter(event)
-            return
-
-        shower_result, energy_result = self.predict(
-            hillas_dict=hillas_dict,
-            subarray=self.subarray,
-            shower_seed=reco_geom_pred,
-            energy_seed=reco_energy_pred,
-            array_pointing=array_pointing,
-            telescope_pointings=telescope_pointings,
-            image_dict=image_dict,
-            mask_dict=mask_dict,
-            time_dict=time_dict,
-        )
-        event.dl2.stereo.geometry[self.__class__.__name__] = shower_result
-        event.dl2.stereo.energy[self.__class__.__name__] = energy_result
-
-        self._store_impact_parameter(event)
-
-
-
-
-[docs]
-    def initialise_templates(self, tel_type):
-        """Check if templates for a given telescope type has been initialised
-        and if not do it and add to the dictionary
-
-        Parameters
-        ----------
-        tel_type: dictionary
-            Dictionary of telescope types in event
-
-        Returns
-        -------
-        boolean: Confirm initialisation
-
-        """
-
-        for t in tel_type:
-            if tel_type[t] in self.prediction.keys() or tel_type[t] == "DUMMY":
-                continue
-
-            if self.dummy_reconstructor:
-                self.prediction[tel_type[t]] = DummyTemplateInterpolator()
+        # Parameter-wise scale factors to normalise the distance metric.
+        minima = self.parameters[0][:]
+        maxima = self.parameters[0][:]
+        for param_vector in self.parameters[1:]:
+            for idx, value in enumerate(param_vector):
+                minima[idx] = min(minima[idx], value)
+                maxima[idx] = max(maxima[idx], value)
+        scales: List[float] = []
+        for idx in range(len(minima)):
+            if idx == 5:
+                scales.append(math.pi)
             else:
-                filename = self.amplitude_template.substitute(
-                    base=self.root_dir, camera=tel_type[t]
-                )
-                self.prediction[tel_type[t]] = TemplateNetworkInterpolator(
-                    filename, bounds=((-5, 1), (-1.5, 1.5))
-                )
-                PROV.add_input_file(
-                    filename, role="ImPACT Template file for " + tel_type[t]
-                )
+                scales.append(max(maxima[idx] - minima[idx], 1.0))
+        self.parameter_scales = scales
 
-            if self.use_time_gradient:
-                if self.dummy_reconstructor:
-                    self.time_prediction[tel_type[t]] = DummyTimeInterpolator()
+    def to_serializable(self) -> Dict[str, Any]:
+        """Return a serialisable representation of the library."""
+
+        pixel_keys: List[Optional[Tuple[int, int]]] = [None] * self.indexer.size
+        for key, idx in self.indexer.lookup.items():
+            pixel_keys[idx] = (int(key[0]), int(key[1]))
+
+        if any(key is None for key in pixel_keys):
+            raise ValueError("Pixel indexer produced incomplete lookup table")
+
+        payload: Dict[str, Any] = {
+            "version": 1,
+            "idw_power": float(self.idw_power),
+            "max_templates": int(self.max_templates),
+            "pixel_keys": [list(key) for key in pixel_keys],
+            "pixel_positions": [list(pos) for pos in self.indexer.positions],
+            "templates": [template[:] for template in self.templates],
+            "parameters": [params[:] for params in self.parameters],
+            "parameter_scales": self.parameter_scales[:],
+        }
+        return payload
+
+    @classmethod
+    def from_serializable(cls, payload: Dict[str, Any]) -> "TemplateLibrary":
+        """Reconstruct a library from :meth:`to_serializable` output."""
+
+        version = int(payload.get("version", 0))
+        if version != 1:
+            raise ValueError(
+                f"Unsupported template library version {version}; expected 1"
+            )
+
+        library = cls.__new__(cls)  # type: ignore[misc]
+        library.dataset = None
+        library.idw_power = float(payload["idw_power"])
+        library.max_templates = int(payload["max_templates"])
+
+        pixel_keys_raw = payload["pixel_keys"]
+        pixel_positions_raw = payload["pixel_positions"]
+        if len(pixel_keys_raw) != len(pixel_positions_raw):
+            raise ValueError("Pixel key / position arrays must be the same length")
+
+        indexer = PixelIndexer.__new__(PixelIndexer)  # type: ignore[misc]
+        lookup: Dict[Tuple[int, int], int] = {}
+        for idx, entry in enumerate(pixel_keys_raw):
+            cluster, pixel = int(entry[0]), int(entry[1])
+            lookup[(cluster, pixel)] = idx
+        indexer.lookup = lookup
+        indexer.positions = [
+            (float(position[0]), float(position[1])) for position in pixel_positions_raw
+        ]
+        indexer.size = len(lookup)
+
+        library.indexer = indexer
+        library.templates = [
+            [float(value) for value in template]
+            for template in payload["templates"]
+        ]
+        library.parameters = [
+            [float(value) for value in params]
+            for params in payload["parameters"]
+        ]
+        library.parameter_scales = [
+            float(component) for component in payload["parameter_scales"]
+        ]
+
+        return library
+
+    def interpolate(self, params: Vector) -> Tuple[Vector, Vector]:
+        if len(params) != len(self.parameter_scales):
+            raise ValueError(
+                "Parameter vector must contain six entries:"
+                " (x_local, y_local, energy, Xmax, source_tet, source_fi_local)"
+            )
+
+        # Compute distances to all templates and retain only the closest ones.
+        import heapq
+
+        candidates: List[Tuple[float, int]] = []
+        for idx, vector in enumerate(self.parameters):
+            deltas = []
+            for axis, component in enumerate(vector):
+                scale = self.parameter_scales[axis]
+                if axis == 5:
+                    delta = wrap_angle(component - params[axis]) / scale
                 else:
-                    filename = self.time_template.substitute(
-                        base=self.root_dir, camera=tel_type[t]
-                    )
-                    self.time_prediction[tel_type[t]] = TimeGradientInterpolator(
-                        filename
-                    )
-                    PROV.add_input_file(
-                        filename, role="ImPACT Time Template file for " + tel_type[t]
-                    )
+                    delta = (component - params[axis]) / scale
+                deltas.append(delta)
+            distance = max(_vector_norm(deltas), 1e-6)
+            candidates.append((distance, idx))
 
-        return True
+        nearest = heapq.nsmallest(self.max_templates, candidates, key=lambda item: item[0])
 
+        weights: List[float] = []
+        template_indices: List[int] = []
+        for distance, index in nearest:
+            weight = 1.0 / (distance ** self.idw_power)
+            weights.append(weight)
+            template_indices.append(index)
 
+        total_weight = sum(weights)
+        if not math.isfinite(total_weight) or total_weight <= 0.0:
+            raise ValueError("Invalid weight normalisation encountered")
+        normalised = [w / total_weight for w in weights]
 
+        template = [0.0] * self.indexer.size
+        for weight, index in zip(normalised, template_indices):
+            image = self.templates[index]
+            for idx, amplitude in enumerate(image):
+                template[idx] += weight * amplitude
 
-[docs]
-    def get_hillas_mean(self):
-        """This is a simple function to find the peak position of each image
-        in an event which will be used later in the Xmax calculation. Peak is
-        found by taking the average position of the n hottest pixels in the
-        image.
-        """
-        peak_x = np.zeros([len(self.pixel_x)])  # Create blank arrays for peaks
-        # rather than a dict (faster)
-        peak_y = np.zeros(peak_x.shape)
-        peak_amp = np.zeros(peak_x.shape)
-
-        # Loop over all tels to take weighted average of pixel
-        # positions This loop could maybe be replaced by an array
-        # operation by a numpy wizard
-        # Maybe a vectorize?
-        tel_num = 0
-
-        for hillas in self.hillas_parameters:
-            peak_x[tel_num] = hillas.fov_lon.to(u.rad).value  # Fill up array
-            peak_y[tel_num] = hillas.fov_lat.to(u.rad).value
-            peak_amp[tel_num] = hillas.intensity
-            tel_num += 1
-
-        self.peak_x = peak_x  # * unit # Add to class member
-        self.peak_y = peak_y  # * unit
-        self.peak_amp = peak_amp
+        return template, normalised
 
 
-
-    # This function would be useful elsewhere so probably be implemented in a
-    # more general form
-
-[docs]
-    def get_shower_max(self, source_x, source_y, core_x, core_y, zen):
-        """Function to calculate the depth of shower maximum geometrically
-        under the assumption that the shower maximum lies at the
-        brightest point of the camera image.
-
-        Parameters
-        ----------
-        source_x: float
-            Event source position in nominal frame
-        source_y: float
-            Event source position in nominal frame
-        core_x: float
-            Event core position in telescope tilted frame
-        core_y: float
-            Event core position in telescope tilted frame
-        zen: float
-            Zenith angle of event
-
-        Returns
-        -------
-        float: Depth of maximum of air shower
-
-        """
-        # Calculate displacement of image centroid from source position (in
-        # rad)
-        disp = np.sqrt((self.peak_x - source_x) ** 2 + (self.peak_y - source_y) ** 2)
-
-        # Calculate impact parameter of the shower
-        impact = np.sqrt(
-            (self.tel_pos_x - core_x) ** 2 + (self.tel_pos_y - core_y) ** 2
-        )
-        # Distance above telescope is ratio of these two (small angle)
-
-        height_tilted = (
-            impact / disp
-        )  # This is in tilted frame along the telescope axis
-        weight = np.power(self.peak_amp, 0.0)  # weight average by sqrt amplitude
-        # sqrt may not be the best option...
-
-        # Take weighted mean of estimates, converted to height above ground
-        mean_height_above_ground = np.sum(
-            height_tilted * np.cos(zen) * weight
-        ) / np.sum(weight)
-
-        # Add on the height of the detector above sea level
-        mean_height_asl = (
-            mean_height_above_ground
-            + self.subarray.reference_location.height.to_value(u.m)
-        )
-
-        if mean_height_asl > 100000 or np.isnan(mean_height_asl):
-            mean_height_asl = 100000
-
-        # Lookup this height in the depth tables, the convert Hmax to Xmax
-        slant_depth = self.atmosphere_profile.slant_depth_from_height(
-            mean_height_asl * u.m, zen * u.rad
-        )
-
-        return slant_depth.to_value(u.g / (u.cm * u.cm))
+# ---------------------------------------------------------------------------
+# Likelihood evaluation
+# ---------------------------------------------------------------------------
 
 
+class LikelihoodModel:
+    """Gaussian log-likelihood between an observation and interpolated template."""
 
-
-[docs]
-    def image_prediction(
-        self, tel_type, zenith, azimuth, energy, impact, x_max, pix_x, pix_y
-    ):
-        """Creates predicted image for the specified pixels, interpolated
-        from the template library.
-
-        Parameters
-        ----------
-        tel_type: string
-            Telescope type specifier
-        energy: float
-            Event energy (TeV)
-        impact: float
-            Impact diance of shower (metres)
-        x_max: float
-            Depth of shower maximum (num bins from expectation)
-        pix_x: ndarray
-            X coordinate of pixels
-        pix_y: ndarray
-            Y coordinate of pixels
-
-        Returns
-        -------
-        ndarray: predicted amplitude for all pixels
-
-        """
-        return self.prediction[tel_type](
-            zenith, azimuth, energy, impact, x_max, pix_x, pix_y
-        )
-
-
-
-
-[docs]
-    def predict_time(self, tel_type, zenith, azimuth, energy, impact, x_max):
-        """Creates predicted image for the specified pixels, interpolated
-        from the template library.
-
-        Parameters
-        ----------
-        tel_type: string
-            Telescope type specifier
-        energy: float
-            Event energy (TeV)
-        impact: float
-            Impact diance of shower (metres)
-        x_max: float
-            Depth of shower maximum (num bins from expectation)
-
-        Returns
-        -------
-        ndarray: predicted amplitude for all pixels
-
-        """
-        time = self.time_prediction[tel_type](zenith, azimuth, energy, impact, x_max)
-        return time.T[0], time.T[1]
-
-
-
-
-[docs]
-    def get_likelihood(
+    def __init__(
         self,
-        source_x,
-        source_y,
-        core_x,
-        core_y,
-        energy,
-        x_max_scale,
-        goodness_of_fit=False,
-    ):
-        """Get the likelihood that the image predicted at the given test
-        position matches the camera image.
+        library: TemplateLibrary,
+        noise_floor: float = 4.0,
+        pedestal_variance: float = 9.0,
+    ) -> None:
+        self.library = library
+        self.noise_floor = max(noise_floor, 1e-3)
+        self.pedestal_variance = max(pedestal_variance, 1e-6)
 
-        Parameters
-        ----------
-        source_x: float
-            Source position of shower in the nominal system (in deg)
-        source_y: float
-            Source position of shower in the nominal system (in deg)
-        core_x: float
-            Core position of shower in tilted telescope system (in m)
-        core_y: float
-            Core position of shower in tilted telescope system (in m)
-        energy: float
-            Shower energy (in TeV)
-        x_max_scale: float
-            Scaling factor applied to geometrically calculated Xmax
-        goodness_of_fit: boolean
-            Determines whether expected likelihood should be subtracted from result
-        Returns
-        -------
-        float: Likelihood the model represents the camera image at this position
+    def expected_image(self, params: Vector) -> Vector:
+        template, _ = self.library.interpolate(params[:])
+        return template
 
-        """
-        if np.isnan(source_x) or np.isnan(source_y):
-            return 1e8
+    def log_likelihood(self, event: EventImage, params: Vector) -> float:
+        observed = event.to_vector(self.library.indexer)
+        predicted = self.expected_image(params)
 
-        # First we add units back onto everything.  Currently not
-        # handled very well, maybe in future we could just put
-        # everything in the correct units when loading in the class
-        # and ignore them from then on
+        total = 0.0
+        noise_floor_sq = self.noise_floor ** 2
+        for obs, pred in zip(observed, predicted):
+            variance = max(pred + self.pedestal_variance, noise_floor_sq)
+            residual = obs - pred
+            total += (residual * residual) / variance + math.log(2.0 * math.pi * variance)
+        return -0.5 * total
 
-        zenith = self.zenith
-        azimuth = self.azimuth
-
-        # Geometrically calculate the depth of maximum given this test position
-        x_max_guess = self.get_shower_max(source_x, source_y, core_x, core_y, zenith)
-        x_max_guess *= x_max_scale
-
-        # Calculate expected Xmax given this energy
-        x_max_exp = guess_shower_depth(energy)  # / np.cos(20*u.deg)
-
-        # Convert to binning of Xmax
-        x_max_diff = x_max_guess - x_max_exp
-
-        # Check for range
-        if x_max_diff > 200:
-            x_max_diff = 200
-        if x_max_diff < -150:
-            x_max_diff = -150
-
-        # Calculate impact distance for all telescopes
-        impact = np.sqrt(
-            (self.tel_pos_x - core_x) ** 2 + (self.tel_pos_y - core_y) ** 2
-        )
-        # And the expected rotation angle
-        phi = np.arctan2(self.tel_pos_y - core_y, self.tel_pos_x - core_x)
-
-        # Rotate and translate all pixels such that they match the
-        # template orientation
-        # numba does not support masked arrays, work on underlying array and add mask back
-        pix_x_rot, pix_y_rot = rotate_translate(
-            self.pixel_y.data, self.pixel_x.data, source_y, source_x, -phi
-        )
-        pix_x_rot = np.ma.array(pix_x_rot, mask=self.pixel_x.mask, copy=COPY_IF_NEEDED)
-        pix_y_rot = np.ma.array(pix_y_rot, mask=self.pixel_y.mask, copy=COPY_IF_NEEDED)
-
-        # In the interpolator class we can gain speed advantages by using masked arrays
-        # so we need to make sure here everything is masked
-        prediction = ma.zeros(self.image.shape)
-        prediction.mask = ma.getmask(self.image)
-
-        time_gradients, time_gradients_uncertainty = (
-            np.zeros(self.image.shape[0]),
-            np.zeros(self.image.shape[0]),
-        )
-        # Loop over all telescope types and get prediction
-        for tel_type in np.unique(self.tel_types).tolist():
-            type_mask = self.tel_types == tel_type
-
-            prediction[type_mask] = self.image_prediction(
-                tel_type,
-                np.rad2deg(zenith),
-                azimuth,
-                energy * np.ones_like(impact[type_mask]),
-                impact[type_mask],
-                x_max_diff * np.ones_like(impact[type_mask]),
-                np.rad2deg(pix_x_rot[type_mask]),
-                np.rad2deg(pix_y_rot[type_mask]),
-            )
-
-            if self.use_time_gradient:
-                tg, tgu = self.predict_time(
-                    tel_type,
-                    np.rad2deg(zenith),
-                    azimuth,
-                    energy * np.ones_like(impact[type_mask]),
-                    impact[type_mask],
-                    x_max_diff * np.ones_like(impact[type_mask]),
-                )
-                time_gradients[type_mask] = tg
-                time_gradients_uncertainty[type_mask] = tgu
-
-        if self.use_time_gradient:
-            time_gradients_uncertainty[time_gradients_uncertainty == 0] = 1e-6
-
-            chi2 = 0
-            for telescope_index, (image, time) in enumerate(zip(self.image, self.time)):
-                time_mask = np.logical_and(
-                    np.invert(ma.getmask(image)),
-                    time > 0,
-                )
-                time_mask = np.logical_and(time_mask, np.isfinite(time))
-                time_mask = np.logical_and(time_mask, image > 5)
-                if (
-                    np.sum(time_mask) > 3
-                    and time_gradients_uncertainty[telescope_index] > 0
-                ):
-                    time_slope = lts_linear_regression(
-                        x=np.rad2deg(pix_x_rot[telescope_index][time_mask]),
-                        y=time[time_mask],
-                        samples=3,
-                    )[0][0]
-
-                    time_like = -1 * norm.logpdf(
-                        time_slope,
-                        loc=time_gradients[telescope_index],
-                        scale=time_gradients_uncertainty[telescope_index],
-                    )
-
-                    chi2 += time_like
-
-        # Likelihood function will break if we find a NaN or a 0
-        prediction[np.isnan(prediction)] = 1e-8
-        prediction[prediction < 1e-8] = 1e-8
-        # prediction *= self.scale_factor[:, np.newaxis]
-
-        # Get likelihood that the prediction matched the camera image
-        mask = ma.getmask(self.image)
-
-        like = neg_log_likelihood_approx(self.image, prediction, self.spe, self.ped)
-        like[mask] = 0
-
-        if goodness_of_fit:
-            like_expectation_gaus = mean_poisson_likelihood_gaussian(
-                prediction, self.spe, self.ped
-            )
-            like_expectation_gaus[mask] = 0
-            mask_shower = np.invert(mask)
-            goodness = np.sum(2 * like - like_expectation_gaus, axis=-1) / np.sqrt(
-                2 * (np.sum(mask_shower, axis=-1) - 6)
-            )
-            return goodness
-
-        like = np.sum(like)
-
-        final_sum = like
-        if self.use_time_gradient:
-            final_sum += chi2
-
-        return final_sum
-
-
-
-
-[docs]
-    def set_event_properties(
+    def maximise(
         self,
-        hillas_dict,
-        image_dict,
-        time_dict,
-        mask_dict,
-        subarray,
-        array_pointing,
-        telescope_pointing,
-    ):
-        """The setter class is used to set the event properties within this
-        class before minimisation can take place. This simply copies a
-        bunch of useful properties to class members, so that we can
-        use them later without passing all this information around.
+        event: EventImage,
+        bounds: Sequence[Tuple[float, float]],
+        rng: random.Random,
+        n_samples: int = 4096,
+        refine_iterations: int = 4,
+        refine_radius: float = 0.1,
+    ) -> Tuple[Vector, float]:
+        if len(bounds) != 6:
+            raise ValueError("Bounds must define six (min, max) pairs")
+        lows = [float(lo) for lo, _ in bounds]
+        highs = [float(hi) for _, hi in bounds]
+        spans = [hi - lo for lo, hi in bounds]
+        for span in spans:
+            if span <= 0:
+                raise ValueError("Invalid parameter bounds")
 
-        Parameters
-        ----------
-        hillas_dict: dict
-            dictionary with telescope IDs as key and
-            HillasParametersContainer instances as values
-        image_dict: dict
-            Amplitude of pixels in camera images
-        time_dict: dict
-            Time information per each pixel in camera images
-        mask_dict: dict
-            Event image masks
-        subarray: dict
-            Type of telescope
-        array_pointing: SkyCoord[AltAz]
-            Array pointing direction in the AltAz Frame
-        telescope_pointing: SkyCoord[AltAz]
-            Telescope pointing directions in the AltAz Frame
-        Returns
-        -------
-        None
+        def random_sample(scale: Sequence[float]) -> Vector:
+            return [lo + rng.random() * span for lo, span in zip(lows, scale)]
 
-        """
-        # First store these parameters in the class so we can use them
-        # in minimisation For most values this is simply copying
-        self.image = image_dict
+        best_params = random_sample(spans)
+        best_ll = self.log_likelihood(event, best_params)
 
-        self.tel_pos_x = np.zeros(len(hillas_dict))
-        self.tel_pos_y = np.zeros(len(hillas_dict))
-        # self.scale_factor = np.zeros(len(hillas_dict))
+        for _ in range(max(1, int(n_samples))):
+            candidate = random_sample(spans)
+            ll = self.log_likelihood(event, candidate)
+            if ll > best_ll:
+                best_ll = ll
+                best_params = candidate
 
-        self.ped = np.zeros(len(hillas_dict))
-        self.tel_types, self.tel_id = list(), list()
+        step = [span * refine_radius for span in spans]
+        for _ in range(refine_iterations):
+            for _ in range(128):
+                proposal = [
+                    max(lo, min(hi, rng.gauss(mu, sigma)))
+                    for mu, sigma, lo, hi in zip(best_params, step, lows, highs)
+                ]
+                ll = self.log_likelihood(event, proposal)
+                if ll > best_ll:
+                    best_ll = ll
+                    best_params = proposal
+            step = [sigma * 0.5 for sigma in step]
 
-        max_pix_x = 0
-        px, py, pa, pt = list(), list(), list(), list()
-        self.hillas_parameters = list()
+        return best_params, best_ll
 
-        # Get telescope positions in tilted frame
-        tilted_frame = TiltedGroundFrame(pointing_direction=array_pointing)
-        ground_positions = subarray.tel_coords
-        grd_coord = SkyCoord(
-            x=ground_positions.x,
-            y=ground_positions.y,
-            z=ground_positions.z,
-            frame=GroundFrame(),
+
+# ---------------------------------------------------------------------------
+# High level helper
+# ---------------------------------------------------------------------------
+
+
+def _default_bounds(dataset: TAIGADataset) -> List[Tuple[float, float]]:
+    params = [vector[:] for vector in dataset.template_vectors]
+    minima = params[0][:]
+    maxima = params[0][:]
+    for vector in params[1:]:
+        for idx, value in enumerate(vector):
+            minima[idx] = min(minima[idx], value)
+            maxima[idx] = max(maxima[idx], value)
+
+    margins = [100.0, 100.0, 10.0, 50.0, math.radians(1.0), math.radians(5.0)]
+    minima = [m - margin for m, margin in zip(minima, margins)]
+    maxima = [m + margin for m, margin in zip(maxima, margins)]
+
+    minima[0] = max(minima[0], -1000.0)
+    minima[1] = max(minima[1], -1000.0)
+    maxima[0] = min(maxima[0], 1000.0)
+    maxima[1] = min(maxima[1], 1000.0)
+    minima[2] = max(minima[2], 5.0)
+    maxima[2] = min(maxima[2], 400.0)
+    minima[3] = max(minima[3], 100.0)
+    maxima[3] = min(maxima[3], 900.0)
+    minima[4] = max(minima[4], math.radians(25.0))
+    maxima[4] = min(maxima[4], math.radians(45.0))
+    minima[5] = max(minima[5], -math.pi)
+    maxima[5] = min(maxima[5], math.pi)
+
+    return list(zip(minima, maxima))
+
+
+def estimate_event_parameters(
+    dataset: TAIGADataset,
+    event_index: int,
+    *,
+    leave_one_out: bool = True,
+    rng: Optional[random.Random] = None,
+    n_samples: int = 4096,
+) -> Tuple[Vector, float, EventParameters]:
+    if rng is None:
+        rng = random.Random()
+    if leave_one_out and len(dataset) > 1:
+        working_set = dataset.leave_one_out(event_index)
+    else:
+        working_set = dataset
+
+    library = TemplateLibrary(working_set)
+    model = LikelihoodModel(library)
+
+    bounds = _default_bounds(dataset)
+    best_params, best_ll = model.maximise(
+        dataset.events[event_index],
+        bounds=bounds,
+        rng=rng,
+        n_samples=n_samples,
+    )
+
+    true_params = dataset.parameters[event_index]
+    return best_params, best_ll, true_params
+
+
+def _matching_csv_path(txt_path: Path) -> Path:
+    stem = txt_path.name
+    if "_clean_" not in stem:
+        raise ValueError(
+            f"Cannot derive CSV filename from {txt_path!s}: missing '_clean_' marker"
+        )
+    csv_name = stem.replace("_clean_", "_hillas_")
+    csv_name = csv_name.rsplit(".", 1)[0] + ".csv"
+    return txt_path.with_name(csv_name)
+
+
+def _load_datasets(
+    paths: Sequence[Path], limit: Optional[int] = None
+) -> TAIGADataset:
+    paths = list(paths)
+    if not paths:
+        raise ValueError("At least one template file must be provided")
+
+    events: List[EventImage] = []
+    parameters: List[EventParameters] = []
+    for txt_path in paths:
+        csv_path = _matching_csv_path(txt_path)
+        dataset = TAIGADataset(txt_path, csv_path)
+        events.extend(dataset.events)
+        parameters.extend(dataset.parameters)
+
+    if limit is not None:
+        limit = max(0, int(limit))
+        events = events[:limit]
+        parameters = parameters[:limit]
+
+    combined = TAIGADataset.__new__(TAIGADataset)  # type: ignore[misc]
+    combined.events = events
+    combined.parameters = parameters
+    combined.template_vectors = [p.template_vector() for p in parameters]
+    combined.pixel_indexer = PixelIndexer(events)
+    return combined
+
+
+def load_configuration(path: Path) -> Dict[str, object]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    required = ["template_txt_files", "test_txt_file", "output_csv", "model_path"]
+    for key in required:
+        if key not in payload:
+            raise ValueError(f"Configuration missing required key {key!r}")
+    return payload
+
+
+def _iter_template_paths(entries: Iterable[str]) -> Iterator[Path]:
+    for entry in entries:
+        path = Path(entry).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Template file not found: {path}")
+        yield path
+
+
+def save_model_package(
+    model: LikelihoodModel,
+    bounds: Sequence[Tuple[float, float]],
+    path: Path,
+) -> None:
+    """Persist the likelihood model and optimisation bounds to ``path``."""
+
+    serialised = {
+        "version": 1,
+        "noise_floor": float(model.noise_floor),
+        "pedestal_variance": float(model.pedestal_variance),
+        "bounds": [[float(lo), float(hi)] for lo, hi in bounds],
+        "library": model.library.to_serializable(),
+    }
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("wb") as handle:
+        pickle.dump(serialised, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_model_package(
+    path: Path,
+) -> Tuple[LikelihoodModel, List[Tuple[float, float]]]:
+    """Load a previously saved likelihood model."""
+
+    if not path.exists():
+        raise FileNotFoundError(f"Saved model not found: {path}")
+
+    with path.open("rb") as handle:
+        payload = pickle.load(handle)
+
+    version = int(payload.get("version", 0))
+    if version != 1:
+        raise ValueError(
+            f"Unsupported model package version {version}; expected 1"
         )
 
-        self.array_direction = array_pointing
-        self.zenith = (np.pi / 2) - self.array_direction.alt.to(u.rad).value
-        self.azimuth = self.array_direction.az.to(u.deg).value
+    library = TemplateLibrary.from_serializable(payload["library"])
+    model = LikelihoodModel(
+        library,
+        noise_floor=float(payload["noise_floor"]),
+        pedestal_variance=float(payload["pedestal_variance"]),
+    )
+    bounds = [
+        (float(lo), float(hi)) for lo, hi in payload["bounds"]
+    ]
+    return model, bounds
 
-        self.nominal_frame = NominalFrame(origin=self.array_direction)
 
-        tilt_coord = grd_coord.transform_to(tilted_frame)
-        type_tel = {}
-        indices = subarray.tel_ids_to_indices(list(hillas_dict.keys()))
+def reconstruct_dataset(
+    model: LikelihoodModel,
+    bounds: Sequence[Tuple[float, float]],
+    dataset: TAIGADataset,
+    *,
+    rng: Optional[random.Random] = None,
+    n_samples: int = 4096,
+    refine_iterations: int = 4,
+    refine_radius: float = 0.1,
+    limit: Optional[int] = None,
+) -> List[Dict[str, float]]:
+    """Reconstruct parameters for ``dataset`` using a pre-trained model."""
 
-        # So here we must loop over the telescopes
-        for tel_id, i in zip(hillas_dict, range(len(hillas_dict))):
-            geometry = subarray.tel[tel_id].camera.geometry
-            type = subarray.tel[tel_id].camera.name
-            type_tel[tel_id] = type
+    if rng is None:
+        rng = random.Random()
 
-            mask = mask_dict[tel_id]
+    max_events = None if limit is None else max(0, int(limit))
+    results: List[Dict[str, float]] = []
+    for index, (event, truth) in enumerate(zip(dataset.events, dataset.parameters)):
+        if max_events is not None and index >= max_events:
+            break
 
-            focal_length = subarray.tel[tel_id].optics.effective_focal_length
-            camera_frame = CameraFrame(
-                telescope_pointing=telescope_pointing[tel_id],
-                focal_length=focal_length,
+        best_params_local, best_ll = model.maximise(
+            event,
+            bounds=bounds,
+            rng=rng,
+            n_samples=n_samples,
+            refine_iterations=refine_iterations,
+            refine_radius=refine_radius,
+        )
+
+        x_local, y_local, energy, xmax, source_tet, source_fi_local = best_params_local
+        x_global, y_global = EventParameters.ground_from_local(
+            x_local, y_local, truth.tel_fi
+        )
+        source_fi_global = EventParameters.source_fi_from_local(
+            source_fi_local, truth.tel_fi
+        )
+
+        results.append(
+            {
+                "event_index": float(index),
+                "log_likelihood": float(best_ll),
+                "x_ground_est": float(x_global),
+                "y_ground_est": float(y_global),
+                "energy_est": float(energy),
+                "xmax_est": float(xmax),
+                "source_tet_est": float(source_tet),
+                "source_fi_est": float(source_fi_global),
+                "x_ground_true": float(truth.x_ground),
+                "y_ground_true": float(truth.y_ground),
+                "energy_true": float(truth.energy),
+                "xmax_true": float(truth.xmax),
+                "source_tet_true": float(truth.source_tet),
+                "source_fi_true": float(truth.source_fi),
+                "tel_fi": float(truth.tel_fi),
+            }
+        )
+
+    return results
+
+
+def run_reconstruction_from_config(config_path: Path) -> List[Dict[str, float]]:
+    """Run the likelihood reconstruction described by ``config_path``.
+
+    The configuration is a JSON object whose keys mirror the ones documented in
+    ``README.md``.  On the first invocation the template library is assembled
+    from the listed dumps, the likelihood model is trained, and both are cached
+    to ``model_path``.  Later calls reuse the cached model unless
+    ``force_rebuild`` is requested.  Limits such as ``template_event_limit`` and
+    ``test_event_limit`` remain optional and default to loading every available
+    event.  ``max_templates`` caps the number of neighbours used for
+    inverse-distance weighting inside the :class:`TemplateLibrary`; keep it at a
+    manageable value to avoid diluting the influence of the closest templates
+    when very large template collections are supplied.
+
+    Returns
+    -------
+    list of dict
+        Reconstructed parameters and their ground-truth labels for every
+        processed test event.
+    """
+
+    config = load_configuration(config_path)
+    model_path = Path(config["model_path"]).expanduser().resolve()
+    force_rebuild = bool(config.get("force_rebuild", False))
+
+    model: LikelihoodModel
+    bounds: List[Tuple[float, float]]
+
+    if model_path.exists() and not force_rebuild:
+        model, bounds = load_model_package(model_path)
+    else:
+        template_paths = list(
+            _iter_template_paths(
+                config["template_txt_files"]  # type: ignore[arg-type]
             )
-            camera_coords = SkyCoord(
-                x=geometry.pix_x[mask], y=geometry.pix_y[mask], frame=camera_frame
-            )
-            nominal_coords = camera_coords.transform_to(self.nominal_frame)
-
-            px.append(nominal_coords.fov_lon.to(u.rad).value)
-            if len(px[i]) > max_pix_x:
-                max_pix_x = len(px[i])
-            py.append(nominal_coords.fov_lat.to(u.rad).value)
-            pa.append(image_dict[tel_id][mask])
-            pt.append(time_dict[tel_id][mask])
-
-            self.ped[i] = self.ped_table[type]
-            self.tel_types.append(type)
-            self.tel_id.append(tel_id)
-
-            self.tel_pos_x[i] = tilt_coord[indices[i]].x.to(u.m).value
-            self.tel_pos_y[i] = tilt_coord[indices[i]].y.to(u.m).value
-
-            self.hillas_parameters.append(hillas_dict[tel_id])
-            # self.scale_factor[i] = 1#self.template_scale[tel_id]
-
-        # Most interesting stuff is now copied to the class, but to remove our requirement
-        # for loops we must copy the pixel positions to an array with the length of the
-        # largest image
-
-        # First allocate everything
-        shape = (len(hillas_dict), max_pix_x)
-        self.pixel_x, self.pixel_y = ma.zeros(shape), ma.zeros(shape)
-        self.image, self.time, self.ped, self.spe = (
-            ma.zeros(shape),
-            ma.zeros(shape),
-            ma.zeros(shape),
-            ma.zeros(shape),
         )
-        self.tel_types = np.array(self.tel_types)
+        template_limit = config.get("template_event_limit")
+        template_dataset = _load_datasets(template_paths, limit=template_limit)
 
-        # Copy everything into our masked arrays
-        for i in range(len(hillas_dict)):
-            array_len = len(px[i])
-            self.pixel_x[i][:array_len] = px[i]
-            self.pixel_y[i][:array_len] = py[i]
-            self.image[i][:array_len] = pa[i]
-            self.time[i][:array_len] = pt[i]
-            self.ped[i][:] = self.ped_table[self.tel_types[i]]
-            self.spe[i][:] = 0.5
-
-        # Set the image mask
-        mask = self.image <= 0.0
-        self.pixel_x[mask], self.pixel_y[mask] = ma.masked, ma.masked
-        self.image[mask] = ma.masked
-        self.time[mask] = ma.masked
-
-        # Finally run some functions to get ready for the event
-        self.get_hillas_mean()
-        self.initialise_templates(type_tel)
-
-
-
-
-[docs]
-    def predict(
-        self,
-        hillas_dict,
-        subarray,
-        array_pointing,
-        shower_seed,
-        energy_seed,
-        telescope_pointings=None,
-        image_dict=None,
-        mask_dict=None,
-        time_dict=None,
-    ):
-        """Predict method for the ImPACT reconstructor.
-        Used to calculate the reconstructed ImPACT shower geometry and energy.
-
-        Parameters
-        ----------
-        shower_seed: ReconstructedShowerContainer
-            Seed shower geometry to be used in the fit
-        energy_seed: ReconstructedEnergyContainer
-            Seed energy to be used in fit
-
-        Returns
-        -------
-        ReconstructedShowerContainer, ReconstructedEnergyContainer:
-        """
-        if image_dict is None:
-            raise EmptyImages("Images not passed to ImPACT reconstructor")
-
-        self.set_event_properties(
-            copy.deepcopy(hillas_dict),
-            image_dict,
-            time_dict,
-            mask_dict,
-            subarray,
-            array_pointing,
-            telescope_pointings,
+        library = TemplateLibrary(
+            template_dataset,
+            idw_power=float(config.get("idw_power", 2.0)),
+            max_templates=int(config.get("max_templates", 64)),
         )
-
-        self.reset_interpolator()
-
-        like_min = 1e9
-        fit_params = None
-
-        for cleaning in shower_seed:
-            # Copy all of our seed parameters out of the shower objects
-            # We need to convert the shower direction to the nominal system
-            horizon_seed = SkyCoord(
-                az=shower_seed[cleaning].az,
-                alt=shower_seed[cleaning].alt,
-                frame=AltAz(),
-            )
-            nominal_seed = horizon_seed.transform_to(self.nominal_frame)
-
-            source_x = nominal_seed.fov_lon.to_value(u.rad)
-            source_y = nominal_seed.fov_lat.to_value(u.rad)
-            # And the core position to the tilted ground frame
-            ground = SkyCoord(
-                x=shower_seed[cleaning].core_x,
-                y=shower_seed[cleaning].core_y,
-                z=0 * u.m,
-                frame=GroundFrame,
-            )
-            tilted = ground.transform_to(
-                TiltedGroundFrame(pointing_direction=self.array_direction)
-            )
-            tilt_x = tilted.x.to(u.m).value
-            tilt_y = tilted.y.to(u.m).value
-            zenith = 90 * u.deg - self.array_direction.alt
-
-            for energy_reco in energy_seed:
-                energy = energy_seed[energy_reco].energy.value
-
-                seed, step, limits = create_seed(
-                    source_x, source_y, tilt_x, tilt_y, energy
-                )
-
-                # Perform maximum likelihood fit
-                fit_params_min, errors, like = self.minimise(
-                    params=seed,
-                    step=step,
-                    limits=limits,
-                )
-                #            fit_params_min, like = self.energy_guess(seed)
-                if like < like_min:
-                    fit_params = fit_params_min
-                    like_min = like
-
-        if fit_params is None:
-            return INVALID_GEOMETRY, INVALID_ENERGY
-
-        # Now do full minimisation
-        seed = create_seed(
-            fit_params[0], fit_params[1], fit_params[2], fit_params[3], fit_params[4]
+        model = LikelihoodModel(
+            library,
+            noise_floor=float(config.get("noise_floor", 4.0)),
+            pedestal_variance=float(config.get("pedestal_variance", 9.0)),
         )
+        bounds = _default_bounds(template_dataset)
+        save_model_package(model, bounds, model_path)
 
-        fit_params, errors, like = self.minimise(
-            params=seed[0],
-            step=seed[1],
-            limits=seed[2],
+    test_txt = Path(config["test_txt_file"]).expanduser().resolve()
+    test_csv = _matching_csv_path(test_txt)
+    test_dataset = TAIGADataset(test_txt, test_csv)
+
+    seed = config.get("random_seed")
+    rng = random.Random(seed)
+    n_samples = int(config.get("n_samples", 4096))
+    refine_iterations = int(config.get("refine_iterations", 4))
+    refine_radius = float(config.get("refine_radius", 0.1))
+    test_limit = config.get("test_event_limit")
+
+    results = reconstruct_dataset(
+        model,
+        bounds,
+        test_dataset,
+        rng=rng,
+        n_samples=n_samples,
+        refine_iterations=refine_iterations,
+        refine_radius=refine_radius,
+        limit=test_limit,
+    )
+
+    output_csv = Path(config["output_csv"]).expanduser().resolve()
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+    with output_csv.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=[
+                "event_index",
+                "log_likelihood",
+                "x_ground_est",
+                "y_ground_est",
+                "energy_est",
+                "xmax_est",
+                "source_tet_est",
+                "source_fi_est",
+                "x_ground_true",
+                "y_ground_true",
+                "energy_true",
+                "xmax_true",
+                "source_tet_true",
+                "source_fi_true",
+                "tel_fi",
+            ],
         )
+        writer.writeheader()
+        for row in results:
+            writer.writerow(row)
 
-        # Create a container class for reconstructed shower
+    return results
 
-        # Convert the best fits direction and core to Horizon and ground systems and
-        # copy to the shower container
-        nominal = SkyCoord(
-            fov_lon=fit_params[0] * u.rad,
-            fov_lat=fit_params[1] * u.rad,
-            frame=self.nominal_frame,
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Entry point for running the reconstruction from the command line."""
+
+    if argv is None:
+        argv = sys.argv[1:]
+
+    config_path: Path
+    if argv:
+        config_path = Path(argv[0])
+    else:
+        env_value = os.environ.get(DEFAULT_CONFIG_ENV)
+        if env_value:
+            config_path = Path(env_value)
+        else:
+            config_path = DEFAULT_CONFIG_PATH
+
+    config_path = config_path.expanduser().resolve()
+
+    if not config_path.exists():
+        print(
+            "[TAIGA] Configuration file not found:",
+            config_path,
+            f"(set {DEFAULT_CONFIG_ENV} or pass a path)",
         )
-        horizon = nominal.transform_to(AltAz())
+        return 1
 
-        shower_result = ReconstructedGeometryContainer()
-        shower_result.prefix = self.__class__.__name__
-        # Transform everything back to a useful system
-        shower_result.alt, shower_result.az = horizon.alt, horizon.az
-        tilted = SkyCoord(
-            x=fit_params[2] * u.m,
-            y=fit_params[3] * u.m,
-            z=0 * u.m,
-            frame=TiltedGroundFrame(pointing_direction=self.array_direction),
-        )
-        ground = project_to_ground(tilted)
+    config = load_configuration(config_path)
+    output_csv = Path(config["output_csv"]).expanduser().resolve()
 
-        shower_result.core_x = ground.x
-        shower_result.core_y = ground.y
+    print(f"[TAIGA] Loading reconstruction settings from {config_path}")
+    print(
+        f"[TAIGA] Cached model will be stored at "
+        f"{Path(config['model_path']).expanduser().resolve()}"
+    )
 
-        shower_result.core_tilted_x = tilted.x
-        shower_result.core_tilted_y = tilted.y
+    results = run_reconstruction_from_config(config_path)
 
-        shower_result.core_tilted_uncert_x = errors[2] * u.m
-        shower_result.core_tilted_uncert_y = errors[3] * u.m
+    print(
+        f"[TAIGA] Processed {len(results)} test events. "
+        f"Results written to {output_csv}"
+    )
 
-        shower_result.is_valid = True
-
-        # Currently no errors not available to copy NaN
-        shower_result.alt_uncert = source_x * u.rad
-        shower_result.az_uncert = source_y * u.rad
-        # shower_result.core_uncert = np.nan
-
-        # Copy reconstructed Xmax
-        slant_depth = (
-            fit_params[5]
-            * self.get_shower_max(
-                fit_params[0],
-                fit_params[1],
-                fit_params[2],
-                fit_params[3],
-                zenith.to(u.rad).value,
-            )
-            * u.g
-            / (u.cm * u.cm)
-        )
-        # h_max really is the vertical altitude of the maximum above sea level
-        shower_result.h_max = self.atmosphere_profile.height_from_slant_depth(
-            slant_depth
-        )
-        shower_result.h_max_uncert = errors[5] * shower_result.h_max
-
-        goodness_of_fit = self.get_likelihood(
-            fit_params[0],
-            fit_params[1],
-            fit_params[2],
-            fit_params[3],
-            fit_params[4],
-            fit_params[5],
-            True,
-        )
-
-        shower_result.goodness_of_fit = np.sum(goodness_of_fit)
-        shower_result.telescopes = self.tel_id
-        shower_result.is_valid = True
-
-        # Create a container class for reconstructed energy
-        energy_result = ReconstructedEnergyContainer(
-            prefix=self.__class__.__name__,
-            energy=fit_params[4] * u.TeV,
-            energy_uncert=errors[4] * u.TeV,
-            telescopes=self.tel_id,
-            is_valid=True,
-            goodness_of_fit=np.sum(goodness_of_fit),
-        )
-
-        return shower_result, energy_result
+    return 0
 
 
-
-
-[docs]
-    def minimise(
-        self,
-        params,
-        step,
-        limits,
-    ):
-        """
-
-        Parameters
-        ----------
-        params: ndarray
-            Seed parameters for fit
-        step: ndarray
-            Initial step size in the fit
-        limits: ndarray
-            Fit bounds
-        Returns
-        -------
-        tuple: best fit parameters and errors
-        """
-        limits = np.asarray(limits)
-
-        energy = params[4]
-        xmax_scale = 1
-
-        # Now do the minimisation proper
-        minimizer = Minuit(
-            self.get_likelihood,
-            source_x=params[0],
-            source_y=params[1],
-            core_x=params[2],
-            core_y=params[3],
-            energy=energy,
-            x_max_scale=xmax_scale,
-            goodness_of_fit=False,
-        )
-        # This time leave everything free
-        minimizer.fixed = [False, False, False, False, False, False, True]
-        minimizer.errors = step
-        minimizer.limits = limits
-        minimizer.errordef = MINUIT_ERRORDEF
-
-        # Tighter fit tolerances
-        minimizer.tol *= MINUIT_TOLERANCE_FACTOR
-        minimizer.strategy = MINUIT_STRATEGY
-
-        # Fit and output parameters and errors
-        _ = minimizer.migrad(iterate=MIGRAD_ITERATE)
-        fit_params = minimizer.values
-        errors = minimizer.errors
-
-        return (
-            (
-                fit_params["source_x"],
-                fit_params["source_y"],
-                fit_params["core_x"],
-                fit_params["core_y"],
-                fit_params["energy"],
-                fit_params["x_max_scale"],
-            ),
-            (
-                errors["source_x"],
-                errors["source_y"],
-                errors["core_x"],
-                errors["core_x"],
-                errors["energy"],
-                errors["x_max_scale"],
-            ),
-            minimizer.fval,
-        )
-
-
-
-
-[docs]
-    def reset_interpolator(self):
-        """
-        This function is needed in order to reset some variables in the interpolator
-        at each new event. Without this reset, a new event starts with information
-        from the previous event.
-        """
-        for key in self.prediction:
-            self.prediction[key].reset()
-        for key in self.time_prediction:
-            self.time_prediction[key].reset()
+if __name__ == "__main__":
+    raise SystemExit(main())
